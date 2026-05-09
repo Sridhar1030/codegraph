@@ -7,6 +7,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+from dataclasses import dataclass, field
+
 from codegraph.filters import should_exclude
 from codegraph.models import FunctionNode, RawCall
 
@@ -128,11 +130,32 @@ def _detect_dynamic_dispatch(func_node: ast.AST) -> list[int]:
     return lines
 
 
+@dataclass
+class KFPTask:
+    """A task instantiation inside a @dsl.pipeline function body."""
+    variable: str          # local variable name (e.g. "prep")
+    component_name: str    # component function called (e.g. "preprocess")
+    lineno: int
+    kwargs: dict[str, str] = field(default_factory=dict)  # param -> source expression
+
+
+@dataclass
+class KFPDataEdge:
+    """A data dependency between two KFP components."""
+    source_component: str   # component producing the output
+    target_component: str   # component consuming the output
+    output_key: str         # output name (e.g. "clean_data" or "output")
+    input_param: str        # input parameter name on the target
+    pipeline_func: str      # which pipeline function this edge belongs to
+    lineno: int
+
+
 class ScanResult:
     """Raw output of scanning a codebase before resolution."""
     __slots__ = (
         "nodes", "raw_calls", "type_scopes", "class_names",
         "dynamic_lines", "imports", "file_imports",
+        "kfp_components", "kfp_pipelines", "kfp_tasks", "kfp_data_edges",
     )
 
     def __init__(self) -> None:
@@ -143,6 +166,178 @@ class ScanResult:
         self.dynamic_lines: dict[str, list[int]] = {}
         self.imports: dict[str, list[str]] = {"internal": [], "external": []}
         self.file_imports: dict[str, dict[str, str]] = {}
+        self.kfp_components: set[str] = set()       # function names with @dsl.component
+        self.kfp_pipelines: set[str] = set()         # function names with @dsl.pipeline
+        self.kfp_tasks: dict[str, list[KFPTask]] = {}  # pipeline_id -> tasks
+        self.kfp_data_edges: list[KFPDataEdge] = []
+
+
+_KFP_COMPONENT_DECORATORS = {"component", "container_component"}
+_KFP_PIPELINE_DECORATORS = {"pipeline"}
+
+
+def _is_kfp_decorator(dec: ast.expr, kind: set[str]) -> bool:
+    """Check if a decorator matches a KFP decorator pattern.
+
+    Handles: @component, @dsl.component, @dsl.component(...), @kfp.dsl.component
+    """
+    if isinstance(dec, ast.Call):
+        return _is_kfp_decorator(dec.func, kind)
+    if isinstance(dec, ast.Name):
+        return dec.id in kind
+    if isinstance(dec, ast.Attribute):
+        return dec.attr in kind
+    return False
+
+
+def _has_kfp_decorator(func_node: ast.FunctionDef | ast.AsyncFunctionDef, kind: set[str]) -> bool:
+    return any(_is_kfp_decorator(d, kind) for d in func_node.decorator_list)
+
+
+def _extract_output_ref(node: ast.expr) -> tuple[str, str] | None:
+    """Extract (variable, output_key) from task output access patterns.
+
+    Handles:
+        task.output         -> (task, "output")
+        task.outputs["key"] -> (task, "key")
+    """
+    # task.output
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.attr == "output":
+            return (node.value.id, "output")
+        if node.attr == "outputs":
+            return (node.value.id, "outputs")
+
+    # task.outputs["key"]
+    if isinstance(node, ast.Subscript):
+        if isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name):
+            if node.value.attr == "outputs":
+                var_name = node.value.value.id
+                # Extract the key from the subscript
+                sl = node.slice
+                if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                    return (var_name, sl.value)
+
+    return None
+
+
+def _annotation_to_str(node: ast.expr | None) -> str:
+    """Best-effort conversion of an AST annotation node to readable text."""
+    if node is None:
+        return ""
+    if isinstance(node, ast.Constant):
+        return str(node.value)
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _annotation_to_str(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    if isinstance(node, ast.Subscript):
+        base = _annotation_to_str(node.value)
+        sl = _annotation_to_str(node.slice)
+        return f"{base}[{sl}]" if sl else base
+    if isinstance(node, ast.Tuple):
+        return ", ".join(_annotation_to_str(e) for e in node.elts)
+    return ast.dump(node)
+
+
+def _extract_kfp_params(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[dict]:
+    """Extract parameter names, annotations, and return type for a KFP component."""
+    params: list[dict] = []
+    for arg in func_node.args.args:
+        ann = _annotation_to_str(arg.annotation) if arg.annotation else ""
+        params.append({"name": arg.arg, "annotation": ann, "kind": "input"})
+
+    ret = func_node.returns
+    if ret:
+        ann_str = _annotation_to_str(ret)
+        params.append({"name": "return", "annotation": ann_str, "kind": "output"})
+
+    return params
+
+
+def _collect_kfp_wiring(
+    pipeline_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    pipeline_id: str,
+    known_components: set[str],
+    result: ScanResult,
+) -> None:
+    """Walk a pipeline function body and extract task instantiations and data edges."""
+    # Pass 1: collect task variable assignments (e.g. prep = preprocess(...))
+    task_map: dict[str, KFPTask] = {}  # variable -> KFPTask
+
+    for stmt in ast.walk(pipeline_node):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        if not isinstance(stmt.value, ast.Call):
+            continue
+
+        var_name = stmt.targets[0].id
+        call = stmt.value
+        func_name = None
+
+        if isinstance(call.func, ast.Name) and call.func.id in known_components:
+            func_name = call.func.id
+        elif isinstance(call.func, ast.Attribute) and call.func.attr in known_components:
+            func_name = call.func.attr
+
+        if func_name is None:
+            continue
+
+        # Collect keyword arguments for data wiring analysis
+        kwargs: dict[str, str] = {}
+        for kw in call.keywords:
+            if kw.arg:
+                kwargs[kw.arg] = ast.dump(kw.value)
+
+        task = KFPTask(
+            variable=var_name,
+            component_name=func_name,
+            lineno=getattr(stmt, "lineno", 0),
+            kwargs=kwargs,
+        )
+        task_map[var_name] = task
+
+    result.kfp_tasks[pipeline_id] = list(task_map.values())
+
+    # Pass 2: find data dependency edges by checking keyword arguments
+    for stmt in ast.walk(pipeline_node):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        if not isinstance(stmt.value, ast.Call):
+            continue
+
+        var_name = stmt.targets[0].id
+        if var_name not in task_map:
+            continue
+
+        target_task = task_map[var_name]
+        call = stmt.value
+
+        for kw in call.keywords:
+            if kw.arg is None:
+                continue
+            ref = _extract_output_ref(kw.value)
+            if ref is None:
+                continue
+
+            source_var, output_key = ref
+            if source_var not in task_map:
+                continue
+
+            source_task = task_map[source_var]
+            result.kfp_data_edges.append(KFPDataEdge(
+                source_component=source_task.component_name,
+                target_component=target_task.component_name,
+                output_key=output_key,
+                input_param=kw.arg,
+                pipeline_func=pipeline_id,
+                lineno=getattr(stmt, "lineno", 0),
+            ))
 
 
 def scan_codebase(
@@ -186,6 +381,24 @@ def scan_codebase(
 
     result.imports["internal"] = sorted(set(result.imports["internal"]))
     result.imports["external"] = sorted(set(result.imports["external"]))
+
+    # Third pass: extract KFP pipeline wiring (needs kfp_components collected first)
+    if result.kfp_components:
+        for py_file in sorted(root.rglob("*.py")):
+            rel_path = str(py_file.relative_to(root))
+            if should_exclude(rel_path, exclude):
+                continue
+            try:
+                source = py_file.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(source, filename=str(py_file))
+            except (SyntaxError, UnicodeDecodeError, OSError):
+                continue
+            for stmt in ast.walk(tree):
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if _has_kfp_decorator(stmt, _KFP_PIPELINE_DECORATORS):
+                        pipeline_id = f"{rel_path}:{stmt.name}"
+                        _collect_kfp_wiring(stmt, pipeline_id, result.kfp_components, result)
+
     return result
 
 
@@ -214,6 +427,16 @@ def _visit_body(
             dyn = _detect_dynamic_dispatch(stmt)
             if dyn:
                 result.dynamic_lines[node.id] = dyn
+
+            # KFP detection
+            if _has_kfp_decorator(stmt, _KFP_COMPONENT_DECORATORS):
+                result.kfp_components.add(stmt.name)
+                node.node_type = "kfp_component"
+                node.kfp_params = _extract_kfp_params(stmt)
+            elif _has_kfp_decorator(stmt, _KFP_PIPELINE_DECORATORS):
+                result.kfp_pipelines.add(stmt.name)
+                node.node_type = "kfp_pipeline"
+                node.kfp_params = _extract_kfp_params(stmt)
 
 
 def _make_node(

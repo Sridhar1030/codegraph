@@ -211,6 +211,25 @@ def graph_files():
     return _store.get_files()
 
 
+@app.get("/graph/kfp/pipelines")
+def kfp_pipelines():
+    """List all discovered KFP pipelines with metadata."""
+    if not _store.is_loaded():
+        return []
+    return _store.get_kfp_pipelines()
+
+
+@app.get("/graph/kfp/pipeline/{pipeline_id:path}")
+def kfp_pipeline_subgraph(pipeline_id: str):
+    """Get the isolated subgraph for a single KFP pipeline."""
+    if not _store.is_loaded():
+        raise HTTPException(status_code=404, detail="No graph loaded")
+    sub = _store.get_kfp_pipeline_subgraph(pipeline_id)
+    if sub is None:
+        raise HTTPException(status_code=404, detail=f"Pipeline not found: {pipeline_id}")
+    return {"nodes": sub.nodes, "edges": sub.edges, "stats": sub.stats}
+
+
 @app.get("/graph/full")
 def graph_full():
     if not _store.is_loaded():
@@ -362,6 +381,20 @@ svg{width:100%;height:100%}
 #empty-state{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:var(--text2);z-index:10}
 #empty-state h2{font-size:20px;color:var(--text-bright);margin-bottom:8px}
 #empty-state p{font-size:14px;margin-bottom:4px}
+
+/* ── KFP Pipeline DAG ── */
+.kfp-card{cursor:pointer;transition:filter .15s}
+.kfp-card:hover{filter:brightness(1.15)}
+.kfp-card rect{rx:8;ry:8}
+.kfp-edge-label{font-size:10px;fill:var(--text2);pointer-events:none;text-anchor:middle}
+.kfp-param-text{font-size:10px;fill:var(--text2)}
+.kfp-param-input{fill:#00d4aa}
+.kfp-param-output{fill:#f0883e}
+.kfp-title{font-size:13px;font-weight:600;fill:var(--text-bright)}
+.kfp-subtitle{font-size:10px;fill:var(--text2)}
+.kfp-pipeline-header{font-size:16px;font-weight:700;fill:var(--text-bright);text-anchor:middle}
+.kfp-edge-path{fill:none;stroke:#00d4aa;stroke-width:2;marker-end:url(#arr-kfp)}
+.kfp-no-pipelines{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:24px 40px;font-size:15px;color:var(--text2);text-align:center;display:none;z-index:50}
 </style></head><body>
 <div id="app">
 <div id="topbar">
@@ -380,8 +413,15 @@ svg{width:100%;height:100%}
     <div class="view-toggle">
       <button class="vt-btn active" data-view="function" title="Each function/method is an individual node">Functions</button>
       <button class="vt-btn" data-view="class" title="Methods collapsed into parent class nodes">Classes</button>
+      <button class="vt-btn" data-view="pipeline" title="Isolated KFP pipeline DAG view" id="pipeline-btn">Pipeline</button>
     </div>
     <div class="view-hint" id="view-hint">Each function/method is an individual node</div>
+    <div id="pipeline-controls" style="display:none;margin-bottom:8px">
+      <label style="font-size:12px;color:var(--text2);display:block;margin-bottom:4px">Select pipeline:</label>
+      <select id="pipeline-select" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;outline:none">
+        <option value="">Loading...</option>
+      </select>
+    </div>
     <input type="text" id="search" placeholder="Search functions... (highlights in graph)" autocomplete="off">
     <div id="search-results" style="display:none;max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;margin-bottom:8px;background:var(--bg)"></div>
     <label>Min in-degree: <span class="tval" id="in-val">3</span></label>
@@ -422,6 +462,7 @@ svg{width:100%;height:100%}
   <div class="tooltip" id="tooltip"></div>
   <div class="edge-tooltip" id="edge-tooltip"></div>
   <div id="no-modules-msg">No modules selected.<br>Check directories in the sidebar to show nodes.</div>
+  <div id="no-pipelines-msg" class="kfp-no-pipelines">No KFP pipelines found in this codebase.<br>Scan a repo that uses <code>@dsl.component</code> / <code>@dsl.pipeline</code>.</div>
   <div id="empty-state">
     <h2>CodeGraph</h2>
     <p>Enter a path above and click <strong>Scan</strong> to visualize.</p>
@@ -431,6 +472,8 @@ svg{width:100%;height:100%}
     <div class="legend-item" data-filter="top30"><div class="legend-dot" style="background:var(--yellow)"></div>Top 11-30</div>
     <div class="legend-item" data-filter="entry"><div class="legend-diamond" style="background:var(--purple)"></div>Entry points</div>
     <div class="legend-item" data-filter="dispatch"><div class="legend-diamond" style="background:var(--orange)"></div>Dispatch</div>
+    <div class="legend-item" data-filter="kfp_component"><div class="legend-diamond" style="background:#00d4aa"></div>KFP Component</div>
+    <div class="legend-item" data-filter="kfp_pipeline"><div class="legend-diamond" style="background:#00b4d8"></div>KFP Pipeline</div>
     <div class="legend-item" data-filter="internal"><div class="legend-dot" style="background:var(--blue)"></div>Internal</div>
     <div class="legend-item" data-filter="orphan"><div class="legend-dot" style="background:var(--dim);border:1px dashed var(--text2)"></div>Orphaned</div>
     <div class="legend-item" data-filter="external"><div class="legend-dot" style="background:var(--dim)"></div>External pkg</div>
@@ -451,8 +494,8 @@ svg{width:100%;height:100%}
 <script>
 /* ──────── data & constants ──────── */
 var DATA=null;
-var COL={top10:"#f85149",top30:"#d29922",internal:"#58a6ff",external:"#484f58",entry:"#a371f7",orphan:"#6e7681",dispatch:"#f0883e"};
-var COL_LIGHT={top10:"#cf222e",top30:"#9a6700",internal:"#0969da",external:"#8c959f",entry:"#8250df",orphan:"#8c959f",dispatch:"#bc4c00"};
+var COL={top10:"#f85149",top30:"#d29922",internal:"#58a6ff",external:"#484f58",entry:"#a371f7",orphan:"#6e7681",dispatch:"#f0883e",kfp_component:"#00d4aa",kfp_pipeline:"#00b4d8"};
+var COL_LIGHT={top10:"#cf222e",top30:"#9a6700",internal:"#0969da",external:"#8c959f",entry:"#8250df",orphan:"#8c959f",dispatch:"#bc4c00",kfp_component:"#0a9396",kfp_pipeline:"#0077b6"};
 var E={def:"#30363d",defW:0.8,out:"#39d353",inc:"#bc8cff",down:"#f0883e",dim:"rgba(48,54,61,0.12)",hiW:2.5,dimW:0.2,opt:"rgba(240,136,62,0.4)"};
 var E_LIGHT={def:"#afb8c1",defW:0.8,out:"#1a7f37",inc:"#8250df",down:"#bc4c00",dim:"rgba(175,184,193,0.2)",hiW:2.5,dimW:0.3,opt:"rgba(188,76,0,0.35)"};
 function C(){return document.documentElement.getAttribute("data-theme")==="light"?COL_LIGHT:COL;}
@@ -461,6 +504,7 @@ function EC(){return document.documentElement.getAttribute("data-theme")==="ligh
 var ENTRY_DECORATORS=new Set(["get","post","put","delete","patch","head","options",
   "route","api_route","websocket","command","group","app_route","endpoint","on_event",
   "middleware","task","periodic_task","test","fixture","parametrize"]);
+var KFP_DECORATORS=new Set(["component","container_component","pipeline"]);
 
 /* ──────── state ──────── */
 var sim,svg,g,laneG,linkG,nodeG,labelG,orderG;
@@ -720,7 +764,9 @@ function applyFilter(){
 function updateStats(){
   if(!DATA)return;
   var s=DATA.stats,entries=cNodes.filter(function(n){return n.color_class==="entry";}).length;
-  var dispatches=cNodes.filter(function(n){return n.color_class==="dispatch";}).length,maxD=d3.max(cNodes,function(n){return n.depth;})||0;
+  var dispatches=cNodes.filter(function(n){return n.color_class==="dispatch";}).length;
+  var kfpComponents=cNodes.filter(function(n){return n.color_class==="kfp_component";}).length;
+  var maxD=d3.max(cNodes,function(n){return n.depth;})||0;
   var vis=cNodes.length;
   if(hasActiveSelection())vis=computeHighlightSet().size;
   document.getElementById("stats").innerHTML=
@@ -729,6 +775,7 @@ function updateStats(){
     '<div class="stat"><span>Visible edges</span><span class="stat-val">'+cLinks.length+'</span></div>'+
     '<div class="stat"><span>Entry points</span><span class="stat-val" style="color:var(--purple)">'+entries+'</span></div>'+
     '<div class="stat"><span>Dispatch nodes</span><span class="stat-val" style="color:var(--orange)">'+dispatches+'</span></div>'+
+    (kfpComponents?'<div class="stat"><span>KFP components</span><span class="stat-val" style="color:#00d4aa">'+kfpComponents+'</span></div>':'')+
     '<div class="stat"><span>Flow depth</span><span class="stat-val">'+maxD+' layers</span></div>'+
     '<div class="stat"><span>View</span><span class="stat-val">'+(viewMode==="class"?"Class":"Function")+'</span></div>';
 }
@@ -764,9 +811,9 @@ function render(){
   var lk=linkG.selectAll("line.edge").data(cLinks,function(d){return(d.source&&d.source.id||d.source)+"-"+(d.target&&d.target.id||d.target);});
   lk.exit().remove();
   var lkE=lk.enter().append("line").attr("class","edge")
-    .attr("stroke",function(d){return d.type==="option"?e.opt:e.def;})
-    .attr("stroke-width",function(d){return d.type==="option"?0.6:e.defW;})
-    .attr("stroke-dasharray",function(d){return d.type==="option"?"4,3":d.type==="dynamic"?"2,2":null;})
+    .attr("stroke",function(d){return d.type&&d.type.startsWith("data_dependency")?"#00d4aa":d.type==="option"?e.opt:e.def;})
+    .attr("stroke-width",function(d){return d.type==="option"?0.6:d.type&&d.type.startsWith("data_dependency")?1.5:e.defW;})
+    .attr("stroke-dasharray",function(d){return d.type==="option"?"4,3":d.type==="dynamic"?"2,2":d.type&&d.type.startsWith("data_dependency")?"6,3":null;})
     .attr("marker-end","url(#arr-def)");
   var lkM=lkE.merge(lk);
 
@@ -778,32 +825,34 @@ function render(){
 
   var nd=nodeG.selectAll(".node").data(cNodes,function(d){return d.id;});nd.exit().remove();
   var ndE=nd.enter().append(function(d){return document.createElementNS("http://www.w3.org/2000/svg",
-    d.color_class==="entry"||d.color_class==="dispatch"?"rect":"circle");})
+    d.color_class==="entry"||d.color_class==="dispatch"||d.color_class==="kfp_component"||d.color_class==="kfp_pipeline"?"rect":"circle");})
     .attr("class","node").style("cursor","pointer")
     .on("mouseover",showTip).on("mouseout",hideTip)
     .on("click",function(ev,d){ev.stopPropagation();onNodeClick(d);})
     .call(d3.drag().on("start",ds).on("drag",dg).on("end",de));
   var ndM=ndE.merge(nd);
   ndM.each(function(d){var el=d3.select(this),r=rS(d.in_degree+d.out_degree);
-    if(d.color_class==="entry")el.attr("width",r*2).attr("height",r*2).attr("rx",3).attr("ry",3).attr("fill",c.entry).attr("opacity",0.9).attr("stroke","var(--node-stroke)").attr("stroke-width",1.5);
+    if(d.color_class==="kfp_component")el.attr("width",r*2).attr("height",r*2).attr("rx",3).attr("ry",3).attr("fill",c.kfp_component).attr("opacity",0.9).attr("stroke","var(--node-stroke)").attr("stroke-width",1.5);
+    else if(d.color_class==="kfp_pipeline")el.attr("width",r*2).attr("height",r*2).attr("rx",3).attr("ry",3).attr("fill",c.kfp_pipeline).attr("opacity",0.9).attr("stroke","var(--node-stroke)").attr("stroke-width",1.5);
+    else if(d.color_class==="entry")el.attr("width",r*2).attr("height",r*2).attr("rx",3).attr("ry",3).attr("fill",c.entry).attr("opacity",0.9).attr("stroke","var(--node-stroke)").attr("stroke-width",1.5);
     else if(d.color_class==="dispatch")el.attr("width",r*2).attr("height",r*2).attr("rx",3).attr("ry",3).attr("fill",c.dispatch).attr("opacity",0.85).attr("stroke","var(--node-stroke)").attr("stroke-width",1.5);
     else if(d.color_class==="orphan")el.attr("r",Math.max(r,3)).attr("fill","none").attr("stroke",c.orphan).attr("stroke-width",1.5).attr("stroke-dasharray","3,2").attr("opacity",0.5);
     else el.attr("r",r).attr("fill",c[d.color_class]).attr("stroke",d.color_class==="top10"?"var(--node-stroke)":"none").attr("stroke-width",d.color_class==="top10"?2:0).attr("opacity",d.type==="external"?0.45:0.85);
   });
 
-  var topN=cNodes.filter(function(d){return["top10","top30","entry","dispatch"].indexOf(d.color_class)>=0;});
+  var topN=cNodes.filter(function(d){return["top10","top30","entry","dispatch","kfp_component","kfp_pipeline"].indexOf(d.color_class)>=0;});
   var lb=labelG.selectAll("text.nlabel").data(topN,function(d){return d.id;});lb.exit().remove();
   var lbE=lb.enter().append("text").attr("class","nlabel")
     .text(function(d){return d.short_name.length>30?d.short_name.slice(0,27)+"...":d.short_name;})
     .attr("font-size",function(d){return d.color_class==="top10"?9:7;})
-    .attr("fill",function(d){return d.color_class==="entry"?"var(--purple)":d.color_class==="dispatch"?"var(--orange)":d.color_class==="top10"?"var(--text-bright)":"var(--text2)";})
+    .attr("fill",function(d){return d.color_class==="kfp_component"?"#00d4aa":d.color_class==="kfp_pipeline"?"#00b4d8":d.color_class==="entry"?"var(--purple)":d.color_class==="dispatch"?"var(--orange)":d.color_class==="top10"?"var(--text-bright)":"var(--text2)";})
     .attr("text-anchor","middle").attr("dy",function(d){return -rS(d.in_degree+d.out_degree)-4;}).attr("pointer-events","none");
   var lbM=lbE.merge(lb);
 
   sim.on("tick",function(){
     lkM.attr("x1",function(d){return d.source.x;}).attr("y1",function(d){return d.source.y;}).attr("x2",function(d){return d.target.x;}).attr("y2",function(d){return d.target.y;});
     htM.attr("x1",function(d){return d.source.x;}).attr("y1",function(d){return d.source.y;}).attr("x2",function(d){return d.target.x;}).attr("y2",function(d){return d.target.y;});
-    ndM.each(function(d){var el=d3.select(this);if(d.color_class==="entry"||d.color_class==="dispatch"){var r=rS(d.in_degree+d.out_degree);el.attr("x",d.x-r).attr("y",d.y-r);}else el.attr("cx",d.x).attr("cy",d.y);});
+    ndM.each(function(d){var el=d3.select(this);if(d.color_class==="entry"||d.color_class==="dispatch"||d.color_class==="kfp_component"||d.color_class==="kfp_pipeline"){var r=rS(d.in_degree+d.out_degree);el.attr("x",d.x-r).attr("y",d.y-r);}else el.attr("cx",d.x).attr("cy",d.y);});
     lbM.attr("x",function(d){return d.x;}).attr("y",function(d){return d.y;});
     orderG.selectAll(".olabel").each(function(){var el=d3.select(this),lnk=el.datum();
       if(lnk&&lnk.source&&lnk.target)el.attr("x",(lnk.source.x+lnk.target.x)/2).attr("y",(lnk.source.y+lnk.target.y)/2-6);
@@ -827,7 +876,9 @@ function showTip(event,d){
   var tt=document.getElementById("tooltip"),async_=d.is_async?" async":"";
   var decos=d.decorators&&d.decorators.length?'<div class="tt-meta">@'+d.decorators.join(", @")+'</div>':"";
   var tag="";
-  if(d.color_class==="entry")tag='<span class="tt-tag tt-tag-entry">ENTRY POINT</span>';
+  if(d.color_class==="kfp_component")tag='<span class="tt-tag" style="background:rgba(0,212,170,0.15);color:#00d4aa">KFP COMPONENT</span>';
+  else if(d.color_class==="kfp_pipeline")tag='<span class="tt-tag" style="background:rgba(0,180,216,0.15);color:#00b4d8">KFP PIPELINE</span>';
+  else if(d.color_class==="entry")tag='<span class="tt-tag tt-tag-entry">ENTRY POINT</span>';
   else if(d.color_class==="orphan")tag='<span class="tt-tag tt-tag-orphan">ORPHANED</span>';
   else if(d.color_class==="top10")tag='<span class="tt-tag tt-tag-ctrl">CONTROL POINT</span>';
   else if(d.color_class==="dispatch")tag='<span class="tt-tag tt-tag-dispatch">DISPATCH</span>';
@@ -911,9 +962,9 @@ function resetVisuals(){
   nodeG.selectAll(".node").attr("opacity",function(d){return d.color_class==="orphan"?0.5:d.type==="external"?0.45:0.85;});
   labelG.selectAll("text").attr("opacity",1);
   linkG.selectAll("line.edge").each(function(d){
-    d3.select(this).attr("stroke",d.type==="option"?e.opt:e.def)
-      .attr("stroke-width",d.type==="option"?0.6:e.defW)
-      .attr("stroke-dasharray",d.type==="option"?"4,3":d.type==="dynamic"?"2,2":null)
+    d3.select(this).attr("stroke",d.type&&d.type.startsWith("data_dependency")?"#00d4aa":d.type==="option"?e.opt:e.def)
+      .attr("stroke-width",d.type==="option"?0.6:d.type&&d.type.startsWith("data_dependency")?1.5:e.defW)
+      .attr("stroke-dasharray",d.type==="option"?"4,3":d.type==="dynamic"?"2,2":d.type&&d.type.startsWith("data_dependency")?"6,3":null)
       .attr("marker-end","url(#arr-def)").attr("opacity",1);
   });
 }
@@ -929,10 +980,13 @@ function classifyNodes(){
   var top10Ids=new Set(sorted.slice(0,10).map(function(n){return n.id;}));
   var top30Ids=new Set(sorted.slice(10,30).map(function(n){return n.id;}));
   DATA.nodes.forEach(function(n){
+    var isKfp=n.type==="kfp_component"||n.type==="kfp_pipeline";
     var isEntry=(n.decorators||[]).some(function(d){return ENTRY_DECORATORS.has(d.toLowerCase());});
-    if(!isEntry&&n.in_degree===0&&n.out_degree>=3&&n.type!=="external"&&n.type!=="dispatch")isEntry=true;
-    var isOrphan=n.in_degree===0&&n.out_degree===0&&n.type!=="external"&&n.type!=="dispatch";
-    if(n.type==="dispatch")n.color_class="dispatch";
+    if(!isEntry&&n.in_degree===0&&n.out_degree>=3&&n.type!=="external"&&n.type!=="dispatch"&&!isKfp)isEntry=true;
+    var isOrphan=n.in_degree===0&&n.out_degree===0&&n.type!=="external"&&n.type!=="dispatch"&&!isKfp;
+    if(n.type==="kfp_component")n.color_class="kfp_component";
+    else if(n.type==="kfp_pipeline")n.color_class="kfp_pipeline";
+    else if(n.type==="dispatch")n.color_class="dispatch";
     else if(isEntry)n.color_class="entry";
     else if(isOrphan)n.color_class="orphan";
     else if(top10Ids.has(n.id))n.color_class="top10";
@@ -1048,6 +1102,245 @@ function doClear(){
   });
 }
 
+/* ──────── KFP Pipeline View ──────── */
+var kfpPipelines=[];
+var kfpActive=false;
+
+function loadKfpPipelines(){
+  return fetch("/graph/kfp/pipelines").then(function(r){return r.json();}).then(function(data){
+    kfpPipelines=data;
+    var sel=document.getElementById("pipeline-select");
+    if(!data.length){sel.innerHTML='<option value="">No pipelines found</option>';return;}
+    sel.innerHTML=data.map(function(p){
+      return '<option value="'+p.pipeline_id+'">'+p.name+' ('+p.file+':'+p.lineno+') — '+p.task_count+' tasks</option>';
+    }).join("");
+  });
+}
+
+function enterPipelineView(){
+  kfpActive=true;
+  if(sim)sim.stop();
+  document.getElementById("pipeline-controls").style.display="block";
+  document.getElementById("no-modules-msg").style.display="none";
+  document.getElementById("no-pipelines-msg").style.display="none";
+  loadKfpPipelines().then(function(){
+    if(!kfpPipelines.length){
+      g.selectAll("*").remove();
+      laneG=g.append("g");linkG=g.append("g");nodeG=g.append("g");labelG=g.append("g");orderG=g.append("g");
+      document.getElementById("no-pipelines-msg").style.display="block";
+      return;
+    }
+    renderKfpPipeline(kfpPipelines[0].pipeline_id);
+  });
+}
+
+function exitPipelineView(){
+  kfpActive=false;
+  document.getElementById("pipeline-controls").style.display="none";
+  document.getElementById("no-pipelines-msg").style.display="none";
+  g.selectAll("*").remove();
+  laneG=g.append("g");linkG=g.append("g");nodeG=g.append("g");labelG=g.append("g");orderG=g.append("g");
+  applyFilter();
+}
+
+function renderKfpPipeline(pipelineId){
+  if(!pipelineId)return;
+  fetch("/graph/kfp/pipeline/"+encodeURIComponent(pipelineId))
+    .then(function(r){return r.json();})
+    .then(function(data){drawKfpDag(data,pipelineId);})
+    .catch(function(e){console.error("KFP render error:",e);});
+}
+
+function drawKfpDag(data,pipelineId){
+  var container=document.getElementById("graph-container"),W=container.clientWidth,H=container.clientHeight;
+  if(sim)sim.stop();
+  g.selectAll("*").remove();
+  laneG=g.append("g");linkG=g.append("g");nodeG=g.append("g");labelG=g.append("g");orderG=g.append("g");
+
+  var nodes=data.nodes,edges=data.edges;
+  if(!nodes.length)return;
+
+  var defs=d3.select("#graph").select("defs");
+  if(defs.select("#arr-kfp").empty()){
+    defs.append("marker").attr("id","arr-kfp").attr("viewBox","0 -5 10 10").attr("refX",10).attr("refY",0)
+      .attr("markerWidth",8).attr("markerHeight",8).attr("orient","auto")
+      .append("path").attr("d","M0,-5L10,0L0,5").attr("fill","#00d4aa");
+  }
+
+  var pipelineNode=null;
+  var componentNodes=[];
+  nodes.forEach(function(n){
+    if(n.type==="kfp_pipeline")pipelineNode=n;
+    else componentNodes.push(n);
+  });
+
+  /* Build adjacency for data_dependency edges only */
+  var idSet=new Set(componentNodes.map(function(n){return n.id;}));
+  var adj={},inDeg={};
+  componentNodes.forEach(function(n){adj[n.id]=[];inDeg[n.id]=0;});
+  edges.forEach(function(e){
+    var s=e.source,t=e.target;
+    if(idSet.has(s)&&idSet.has(t)&&(e.type||"").startsWith("data_dependency")){
+      adj[s].push(t);
+      inDeg[t]=(inDeg[t]||0)+1;
+    }
+  });
+
+  /* Assign layers via longest-path (gives better DAG spread than topo sort) */
+  var layerOf={};
+  componentNodes.forEach(function(n){layerOf[n.id]=-1;});
+  function longestPath(nid){
+    if(layerOf[nid]>=0)return layerOf[nid];
+    var preds=[];
+    edges.forEach(function(e){
+      if(e.target===nid&&idSet.has(e.source)&&(e.type||"").startsWith("data_dependency"))preds.push(e.source);
+    });
+    if(!preds.length){layerOf[nid]=0;return 0;}
+    var maxP=0;
+    preds.forEach(function(p){var d=longestPath(p);if(d+1>maxP)maxP=d+1;});
+    layerOf[nid]=maxP;
+    return maxP;
+  }
+  componentNodes.forEach(function(n){longestPath(n.id);});
+
+  /* Group nodes by layer */
+  var layers={};
+  componentNodes.forEach(function(n){
+    var l=layerOf[n.id]||0;
+    if(!layers[l])layers[l]=[];
+    layers[l].push(n);
+  });
+  var maxLayer=Math.max.apply(null,Object.keys(layers).map(Number).concat([0]));
+
+  var nodeMap={};nodes.forEach(function(n){nodeMap[n.id]=n;});
+
+  /* Layout: vertical DAG with horizontal spread per layer */
+  var cardW=220,padX=60,padY=50;
+
+  /* Compute card heights based on params */
+  var cardHeights={};
+  componentNodes.forEach(function(n){
+    var params=n.kfp_params||[];
+    var h=42+Math.max(params.length,1)*16+8;
+    cardHeights[n.id]=h;
+  });
+
+  /* Compute Y for each layer: cumulative max height + padding */
+  var layerY={};
+  var cy=80;
+  if(pipelineNode)cy=100;
+  for(var l=0;l<=maxLayer;l++){
+    var nodesInLayer=layers[l]||[];
+    var maxH=0;
+    nodesInLayer.forEach(function(n){var h=cardHeights[n.id]||60;if(h>maxH)maxH=h;});
+    layerY[l]=cy+maxH/2;
+    cy+=maxH+padY;
+  }
+
+  /* Assign positions: center each layer horizontally */
+  var positions={};
+  if(pipelineNode){
+    positions[pipelineNode.id]={x:W/2,y:40};
+  }
+  for(var l=0;l<=maxLayer;l++){
+    var nodesInLayer=layers[l]||[];
+    var totalW=nodesInLayer.length*cardW+(nodesInLayer.length-1)*padX;
+    var startX=W/2-totalW/2+cardW/2;
+    nodesInLayer.forEach(function(n,i){
+      positions[n.id]={x:startX+i*(cardW+padX),y:layerY[l]};
+    });
+  }
+
+  /* Draw pipeline header */
+  if(pipelineNode){
+    labelG.append("text").attr("class","kfp-pipeline-header")
+      .attr("x",positions[pipelineNode.id].x).attr("y",positions[pipelineNode.id].y)
+      .text("@pipeline  "+pipelineNode.short_name);
+    labelG.append("text").attr("class","kfp-subtitle").attr("text-anchor","middle")
+      .attr("x",positions[pipelineNode.id].x).attr("y",positions[pipelineNode.id].y+16)
+      .text(pipelineNode.file+":"+pipelineNode.lineno);
+  }
+
+  /* Draw edges first (behind cards) — only data_dependency edges */
+  edges.forEach(function(e){
+    var s=e.source,t=e.target;
+    if(!positions[s]||!positions[t])return;
+    if(!idSet.has(s)||!idSet.has(t))return;
+    if(!(e.type||"").startsWith("data_dependency"))return;
+    var sp=positions[s],tp=positions[t];
+    var sh=cardHeights[s]||60,th=cardHeights[t]||60;
+    var x1=sp.x,y1=sp.y+sh/2,x2=tp.x,y2=tp.y-th/2;
+
+    var midY=(y1+y2)/2;
+    linkG.append("path").attr("class","kfp-edge-path")
+      .attr("d","M"+x1+","+y1+" C"+x1+","+midY+" "+x2+","+midY+" "+x2+","+y2);
+
+    /* Edge label — offset to the right of the midpoint */
+    var edgeType=e.type||"";
+    if(edgeType.startsWith("data_dependency:")){
+      var label=edgeType.split(":").slice(1).join(":");
+      var lx=(x1+x2)/2,ly=midY;
+      var offset=(x1===x2)?cardW/2+12:16;
+      linkG.append("text").attr("class","kfp-edge-label")
+        .attr("x",lx+offset).attr("y",ly+4)
+        .text(label);
+    }
+  });
+
+  /* Draw component cards */
+  componentNodes.forEach(function(n){
+    var nid=n.id;
+    var pos=positions[nid],h=cardHeights[nid]||60;
+    var gCard=nodeG.append("g").attr("class","kfp-card")
+      .attr("transform","translate("+(pos.x-cardW/2)+","+(pos.y-h/2)+")");
+
+    var isComponent=n.type==="kfp_component";
+    var fill=isComponent?"rgba(0,212,170,0.08)":"rgba(0,180,216,0.08)";
+    var stroke=isComponent?"#00d4aa":"#00b4d8";
+
+    gCard.append("rect").attr("width",cardW).attr("height",h)
+      .attr("fill",fill).attr("stroke",stroke).attr("stroke-width",1.5).attr("rx",8).attr("ry",8);
+
+    /* Title */
+    gCard.append("text").attr("class","kfp-title")
+      .attr("x",12).attr("y",20).text(n.short_name);
+
+    /* Decorator badge */
+    gCard.append("text").attr("class","kfp-subtitle")
+      .attr("x",cardW-10).attr("y",14).attr("text-anchor","end")
+      .text("@"+(n.decorators&&n.decorators[0]||"component"));
+
+    /* Params */
+    var params=n.kfp_params||[];
+    var py=36;
+    params.forEach(function(p){
+      var isOut=p.kind==="output";
+      var color=isOut?"#f0883e":"#00d4aa";
+      var icon=isOut?"\u2192 ":"\u2022 ";
+      var label=p.name+(p.annotation?": "+p.annotation:"");
+      gCard.append("text").attr("class","kfp-param-text")
+        .attr("x",16).attr("y",py).attr("fill",color)
+        .text(icon+label);
+      py+=16;
+    });
+    if(!params.length){
+      gCard.append("text").attr("class","kfp-param-text")
+        .attr("x",16).attr("y",py).text("(no typed params)");
+    }
+  });
+
+  /* Update stats for pipeline view */
+  var pName=pipelineNode?pipelineNode.short_name:pipelineId;
+  document.getElementById("stats").innerHTML=
+    '<div class="stat"><span>Pipeline</span><span class="stat-val" style="color:#00b4d8">'+pName+'</span></div>'+
+    '<div class="stat"><span>Components</span><span class="stat-val" style="color:#00d4aa">'+componentNodes.length+'</span></div>'+
+    '<div class="stat"><span>Data edges</span><span class="stat-val">'+edges.filter(function(e){return(e.type||"").startsWith("data_dependency");}).length+'</span></div>'+
+    '<div class="stat"><span>View</span><span class="stat-val">Pipeline DAG</span></div>';
+
+  /* Re-enable zoom */
+  svg.call(d3.zoom().scaleExtent([0.05,10]).on("zoom",function(e){g.attr("transform",e.transform);}));
+}
+
 /* ──────── init ──────── */
 function init(){
   applyTheme();
@@ -1093,11 +1386,22 @@ function init(){
   document.querySelectorAll(".legend-item[data-filter]").forEach(function(el){el.addEventListener("click",function(){onLegendClick(el.dataset.filter);});});
 
   document.querySelectorAll(".vt-btn").forEach(function(btn){btn.addEventListener("click",function(){
+    var prev=viewMode;
     viewMode=btn.dataset.view;
     document.querySelectorAll(".vt-btn").forEach(function(b){b.classList.remove("active");});btn.classList.add("active");
-    document.getElementById("view-hint").textContent=viewMode==="class"?"Methods collapsed into parent class nodes":"Each function/method is an individual node";
-    applyFilter();
+    if(viewMode==="pipeline"){
+      document.getElementById("view-hint").textContent="Isolated KFP pipeline DAG with inputs/outputs";
+      enterPipelineView();
+    }else{
+      document.getElementById("view-hint").textContent=viewMode==="class"?"Methods collapsed into parent class nodes":"Each function/method is an individual node";
+      if(prev==="pipeline")exitPipelineView();
+      else applyFilter();
+    }
   });});
+
+  document.getElementById("pipeline-select").addEventListener("change",function(){
+    if(kfpActive&&this.value)renderKfpPipeline(this.value);
+  });
 
   document.getElementById("dir-all").addEventListener("click",function(){
     document.querySelectorAll("#dir-list input[type=checkbox]").forEach(function(cb){cb.checked=true;});applyFilter();

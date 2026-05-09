@@ -140,6 +140,7 @@ class NetworkXStore(GraphStore):
     def __init__(self) -> None:
         self._graph: Optional[nx.DiGraph] = None
         self._code_graph: Optional[CodeGraph] = None
+        self._kfp_meta: dict = {}
         self._meta: dict = {}
 
     def load(self, graph: CodeGraph) -> None:
@@ -151,6 +152,7 @@ class NetworkXStore(GraphStore):
                        order=edge.order, type=edge.edge_type)
         self._graph = G
         self._code_graph = graph
+        self._kfp_meta = graph.kfp_pipelines_meta
         self._meta = {
             "total_nodes": G.number_of_nodes(),
             "total_edges": G.number_of_edges(),
@@ -378,6 +380,28 @@ class NetworkXStore(GraphStore):
             visited.update(next_frontier)
             frontier = next_frontier
         return visited
+
+    def get_kfp_pipelines(self) -> list[dict]:
+        """Return metadata for all discovered KFP pipelines."""
+        return list(self._kfp_meta.values())
+
+    def get_kfp_pipeline_subgraph(self, pipeline_id: str) -> Optional[SubGraph]:
+        """Return the isolated subgraph for a single KFP pipeline."""
+        meta = self._kfp_meta.get(pipeline_id)
+        if not meta or not self._graph:
+            return None
+
+        node_ids = set(meta["all_node_ids"])
+        valid = [nid for nid in node_ids if nid in self._graph]
+        sub = self._graph.subgraph(valid)
+        nodes = [dict(sub.nodes[n]) for n in sub.nodes]
+        edges = [{"source": u, "target": v, **d}
+                 for u, v, d in sub.edges(data=True)]
+        return SubGraph(
+            nodes=nodes, edges=edges,
+            stats={"node_count": len(nodes), "edge_count": len(edges),
+                   "pipeline_id": pipeline_id, **meta},
+        )
 
     def get_full_graph_data(self) -> SubGraph:
         """Get the complete graph data for visualization."""

@@ -27,9 +27,10 @@ class FunctionNode:
     file_group: int = 0
     depth: int = 0
     is_generated: bool = False
+    kfp_params: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "short_name": self.short_name,
             "file": self.file,
@@ -49,6 +50,9 @@ class FunctionNode:
             "depth": self.depth,
             "is_generated": self.is_generated,
         }
+        if self.kfp_params:
+            d["kfp_params"] = self.kfp_params
+        return d
 
 
 @dataclass
@@ -82,6 +86,7 @@ class CodeGraph:
     edges: list[CallEdge] = field(default_factory=list)
     external_packages: list[str] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
+    kfp_pipelines_meta: dict = field(default_factory=dict)
 
     def node_by_id(self, node_id: str) -> Optional[FunctionNode]:
         for n in self.nodes:

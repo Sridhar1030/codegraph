@@ -51,6 +51,86 @@ _KNOWN_PACKAGE_MAP = {
     "yaml": "pyyaml", "tabulate": "tabulate",
 }
 
+def _resolve_kfp_edges(scan: ScanResult, graph: CodeGraph, node_by_id: dict[str, FunctionNode]) -> None:
+    """Create data_dependency edges between KFP component nodes."""
+    if not scan.kfp_data_edges:
+        return
+
+    # Build a lookup: component function name -> list of node IDs
+    component_index: dict[str, list[str]] = defaultdict(list)
+    for n in scan.nodes:
+        if n.node_type == "kfp_component":
+            component_index[n.function].append(n.id)
+
+    seen_edges: set[tuple[str, str]] = {(e.source, e.target) for e in graph.edges}
+
+    for data_edge in scan.kfp_data_edges:
+        src_ids = component_index.get(data_edge.source_component, [])
+        tgt_ids = component_index.get(data_edge.target_component, [])
+
+        for src_id in src_ids:
+            for tgt_id in tgt_ids:
+                key = (src_id, tgt_id)
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    label = f"{data_edge.output_key} -> {data_edge.input_param}"
+                    graph.edges.append(CallEdge(
+                        source=src_id,
+                        target=tgt_id,
+                        order=0,
+                        edge_type=f"data_dependency:{label}",
+                    ))
+
+
+def _build_kfp_pipeline_meta(scan: ScanResult, graph: CodeGraph, node_by_id: dict[str, FunctionNode]) -> None:
+    """Attach per-pipeline metadata so the UI can render isolated pipeline views."""
+    if not scan.kfp_pipelines:
+        return
+
+    component_index: dict[str, list[str]] = defaultdict(list)
+    for n in scan.nodes:
+        if n.node_type == "kfp_component":
+            component_index[n.function].append(n.id)
+
+    pipeline_node_index: dict[str, str] = {}
+    for n in scan.nodes:
+        if n.node_type == "kfp_pipeline":
+            pipeline_node_index[f"{n.file}:{n.function}"] = n.id
+
+    meta: dict[str, dict] = {}
+    for pipeline_id, tasks in scan.kfp_tasks.items():
+        node_id = pipeline_node_index.get(pipeline_id)
+        if not node_id:
+            continue
+
+        pipeline_node = node_by_id.get(node_id)
+        component_node_ids: list[str] = []
+        for task in tasks:
+            component_node_ids.extend(component_index.get(task.component_name, []))
+
+        all_node_ids = list(set([node_id] + component_node_ids))
+        all_node_ids_set = set(all_node_ids)
+
+        edges = [
+            e for e in graph.edges
+            if e.source in all_node_ids_set and e.target in all_node_ids_set
+        ]
+
+        meta[pipeline_id] = {
+            "pipeline_id": pipeline_id,
+            "pipeline_node_id": node_id,
+            "name": pipeline_node.function if pipeline_node else pipeline_id,
+            "file": pipeline_node.file if pipeline_node else "",
+            "lineno": pipeline_node.lineno if pipeline_node else 0,
+            "component_node_ids": component_node_ids,
+            "all_node_ids": all_node_ids,
+            "edge_count": len(edges),
+            "task_count": len(tasks),
+        }
+
+    graph.kfp_pipelines_meta = meta
+
+
 def build_graph(scan: ScanResult) -> CodeGraph:
     """Resolve raw calls into edges, building the full CodeGraph."""
     graph = CodeGraph()
@@ -176,6 +256,12 @@ def build_graph(scan: ScanResult) -> CodeGraph:
                 order=0, edge_type="dynamic",
             ))
 
+    # KFP data dependency edges
+    _resolve_kfp_edges(scan, graph, node_by_id)
+
+    # Build KFP pipeline metadata for the store/UI
+    _build_kfp_pipeline_meta(scan, graph, node_by_id)
+
     all_nodes = list(scan.nodes) + list(ext_nodes.values()) + list(dispatch_nodes.values())
 
     in_deg: dict[str, int] = defaultdict(int)
@@ -192,6 +278,7 @@ def build_graph(scan: ScanResult) -> CodeGraph:
     graph.external_packages = scan.imports["external"]
 
     files_scanned = len({n.file for n in scan.nodes})
+    kfp_data_edges = sum(1 for e in graph.edges if e.edge_type.startswith("data_dependency"))
     graph.stats = {
         "total_functions": len(scan.nodes),
         "total_edges_resolved": len(graph.edges),
@@ -200,6 +287,9 @@ def build_graph(scan: ScanResult) -> CodeGraph:
         "dispatch_nodes": len(dispatch_nodes),
         "option_edges": sum(1 for e in graph.edges if e.edge_type == "option"),
         "dynamic_edges": sum(1 for e in graph.edges if e.edge_type == "dynamic"),
+        "kfp_components": len(scan.kfp_components),
+        "kfp_pipelines": len(scan.kfp_pipelines),
+        "kfp_data_edges": kfp_data_edges,
     }
 
     return graph
