@@ -6,7 +6,7 @@ venv/
 *.egg-info/
 dist/
 build/
-
+.cursor/
 *.pkl
 *.log
 .DS_Store
