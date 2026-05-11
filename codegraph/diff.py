@@ -399,9 +399,12 @@ def diff_commits(
         result = _git(repo, "stash", "push", "-m", "codegraph-diff-autostash", check=False)
         did_stash = result.returncode == 0
 
+    resolved_a = _git(repo, "rev-parse", commit_a).stdout.strip()
+    resolved_b = _git(repo, "rev-parse", commit_b).stdout.strip()
+
     try:
-        old_graph = _scan_at_commit(repo, commit_a, scan_subdir)
-        new_graph = _scan_at_commit(repo, commit_b, scan_subdir)
+        old_graph = _scan_at_commit(repo, resolved_a, scan_subdir)
+        new_graph = _scan_at_commit(repo, resolved_b, scan_subdir)
     finally:
         _git(repo, "checkout", "--quiet", "--force", original_ref, check=False)
         if did_stash:

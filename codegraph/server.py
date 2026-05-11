@@ -92,6 +92,20 @@ def resync_repo():
     return _do_scan(_scan_state["repo_path"], _scan_state["exclude_patterns"])
 
 
+@app.post("/clear")
+def clear_graph():
+    log.info("POST /clear — clearing graph and state")
+    _store._graph = None
+    _store._code_graph = None
+    _store._meta = {}
+    _scan_state["repo_path"] = None
+    _scan_state["exclude_patterns"] = []
+    _scan_state["last_scan_time"] = None
+    _scan_state["scan_duration"] = None
+    _scan_state["scanning"] = False
+    return {"status": "cleared"}
+
+
 @app.get("/status")
 def status():
     stats = _store.stats() if _store.is_loaded() else {}
@@ -355,6 +369,7 @@ svg{width:100%;height:100%}
   <input type="text" id="path-input" placeholder="Enter path to Python repo...">
   <button class="tb-btn primary" id="scan-btn">Scan</button>
   <button class="tb-btn" id="resync-btn" disabled>Resync</button>
+  <button class="tb-btn" id="clear-btn" disabled>Clear</button>
   <span id="status-text">No repo loaded</span>
   <button id="theme-toggle" title="Toggle light/dark theme">&#9788;</button>
 </div>
@@ -994,6 +1009,7 @@ function doScan(){
     .then(function(r){if(!r.ok)return r.json().then(function(e){throw new Error(e.detail||"Scan failed");});return r.json();})
     .then(function(){
       document.getElementById("resync-btn").disabled=false;
+      document.getElementById("clear-btn").disabled=false;
       return loadGraph();
     })
     .catch(function(e){setStatus("","Error: "+e.message);})
@@ -1008,6 +1024,28 @@ function doResync(){
     .then(function(){return loadGraph();})
     .catch(function(e){setStatus("","Error: "+e.message);})
     .finally(function(){document.getElementById("resync-btn").disabled=false;});
+}
+
+function doClear(){
+  fetch("/clear",{method:"POST"}).then(function(){
+    DATA=null;cNodes=[];cLinks=[];
+    if(sim)sim.stop();
+    nodeG.selectAll("*").remove();linkG.selectAll("*").remove();
+    labelG.selectAll("*").remove();orderG.selectAll("*").remove();laneG.selectAll("*").remove();
+    clearAllSelections();
+    document.getElementById("stats").innerHTML="";
+    document.getElementById("cp-list").innerHTML="";
+    document.getElementById("ep-list").innerHTML="";
+    document.getElementById("dp-list").innerHTML="";
+    document.getElementById("dir-list").innerHTML="";
+    document.getElementById("search").value="";
+    document.getElementById("search-results").style.display="none";
+    document.getElementById("path-input").value="";
+    document.getElementById("resync-btn").disabled=true;
+    document.getElementById("clear-btn").disabled=true;
+    document.getElementById("empty-state").style.display="block";
+    setStatus("","No repo loaded");
+  });
 }
 
 /* ──────── init ──────── */
@@ -1027,6 +1065,7 @@ function init(){
   document.getElementById("theme-toggle").addEventListener("click",function(){theme=theme==="dark"?"light":"dark";applyTheme();});
   document.getElementById("scan-btn").addEventListener("click",doScan);
   document.getElementById("resync-btn").addEventListener("click",doResync);
+  document.getElementById("clear-btn").addEventListener("click",doClear);
   document.getElementById("path-input").addEventListener("keydown",function(e){if(e.key==="Enter")doScan();});
 
   document.getElementById("search").addEventListener("input",debounce(doSearch,300));
@@ -1072,6 +1111,7 @@ function init(){
       document.getElementById("path-input").value=d.repo_path;
       if(d.total_nodes>0){
         document.getElementById("resync-btn").disabled=false;
+        document.getElementById("clear-btn").disabled=false;
         loadGraph();
       }
     }
