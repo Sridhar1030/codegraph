@@ -167,11 +167,9 @@ impact_analysis(node_id="feast/infra/offline_stores/contrib/oracle_offline_store
 file_overview(file_path="feast/infra/offline_stores/contrib/oracle_offline_store/oracle.py")
 ```
 
-Present a summary to the user explaining:
-- The function is a `@staticmethod` (41 lines) that orchestrates 7 calls
-- It establishes an Oracle connection via ibis, computes date ranges, builds an entity DataFrame from Oracle tables, then delegates to the shared `get_historical_features_ibis` for point-in-time joins
-- It has 524 downstream functions (massive blast radius) and 62 upstream callers
-- The Oracle-specific logic is thin — connection + table reading — while the heavy lifting is in the shared ibis module
+Present the results to the user — summarize what the tools returned about the
+function's execution flow, what it calls, what calls it, and the blast radius.
+Let the data speak for itself.
 
 ## Step 7: Open the Web UI
 
