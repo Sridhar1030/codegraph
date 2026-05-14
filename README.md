@@ -50,6 +50,56 @@ Open [http://localhost:8787](http://localhost:8787), enter a path to a Python pr
 | `GET` | `/graph/file/{path}` | All nodes in a specific file |
 | `GET` | `/graph/full` | Complete graph data for visualization |
 
+## MCP Server (AI Agent Integration)
+
+CodeGraph can be used as an MCP tool server, allowing AI agents in Cursor to query the code graph directly.
+
+### Setup
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "codegraph": {
+    "command": "python",
+    "args": ["-m", "codegraph.mcp_server"],
+    "env": {
+      "PYTHONPATH": "/path/to/parent/of/codegraph",
+      "CODEGRAPH_URL": "http://localhost:8787"
+    }
+  }
+}
+```
+
+The FastAPI server must be running first (`python codegraph_cli.py serve --port 8787`).
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_status` | Check if server is running and graph is loaded |
+| `scan_repo` | Scan a Python repo and build the call graph |
+| `search_functions` | Find functions by name, file, type, or degree |
+| `get_function_detail` | Full detail — file, line, callers, callees, docstring |
+| `impact_analysis` | Who's affected if this function changes? |
+| `get_neighbors` | Direct callers/callees at configurable depth |
+| `get_flowchart` | Call chain tree from a function to its leaves |
+| `file_overview` | All functions in a file with line numbers and stats |
+| `list_files` | All scanned files sorted by function count |
+| `diff_analysis` | Compare two git commits — structural changes + impact |
+
+### Example Agent Prompt
+
+```
+Use the codegraph MCP tools to answer:
+How does get_historical_features work for the Oracle offline store in Feast?
+
+1. search_functions to find the function
+2. get_function_detail for callers/callees
+3. get_flowchart to trace the call chain
+4. impact_analysis for blast radius
+```
+
 ## Architecture
 
 ```
@@ -59,6 +109,7 @@ codegraph/
   models.py        FunctionNode, CallEdge, CodeGraph dataclasses
   store.py         GraphStore ABC + NetworkXStore (swappable to Neo4j)
   server.py        FastAPI web service + built-in D3.js UI
+  mcp_server.py    MCP tool server for AI agent integration
   filters.py       File/directory exclusion patterns
   diff.py          Git diff — compare graphs between commits
   exporters/
