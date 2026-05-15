@@ -32,6 +32,9 @@ mcp = FastMCP(
            `get_neighbors`, `get_flowchart`, `file_overview`, or `list_files`
            to explore the codebase.
         4. Use `diff_analysis` to compare commits.
+        5. For KFP (Kubeflow Pipelines) repos: use `list_kfp_pipelines` to
+           discover pipelines, then `get_kfp_pipeline` to inspect a pipeline's
+           component DAG with typed inputs/outputs and data-flow edges.
 
         Node IDs are qualified names like "file/path.py:ClassName.method_name"
         or "file/path.py:function_name". Use `search_functions` to discover them.
@@ -56,6 +59,10 @@ def _post(path: str, body: dict | None = None) -> Any:
 def _fmt_node_short(n: dict) -> str:
     """One-line summary of a node for list contexts."""
     tags = []
+    if n.get("type") == "kfp_component":
+        tags.append("KFP_COMPONENT")
+    if n.get("type") == "kfp_pipeline":
+        tags.append("KFP_PIPELINE")
     if n.get("color_class") == "entry":
         tags.append("ENTRY")
     if n.get("type") == "dispatch":
@@ -445,6 +452,101 @@ def diff_analysis(
 
     if not s.get("added") and not s.get("removed") and not s.get("modified"):
         lines.append("\nNo structural changes between these commits.")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_kfp_pipelines() -> str:
+    """List all KFP (Kubeflow Pipelines) discovered in the scanned codebase.
+
+    Returns pipeline names, file locations, and task counts for every function
+    decorated with @dsl.pipeline. Use this to discover pipeline IDs needed by
+    get_kfp_pipeline.
+
+    Requires a scanned repo that contains KFP code (@dsl.component / @dsl.pipeline).
+    """
+    try:
+        data = _get("/graph/kfp/pipelines")
+    except httpx.ConnectError:
+        return f"ERROR: Cannot connect to CodeGraph at {CODEGRAPH_URL}."
+
+    if not data:
+        return "No KFP pipelines found. Scan a repo that uses @dsl.component / @dsl.pipeline."
+
+    lines = [f"Found {len(data)} KFP pipeline(s):\n"]
+    for p in data:
+        lines.append(
+            f"  {p['name']}\n"
+            f"    ID: {p['pipeline_id']}\n"
+            f"    File: {p.get('file', '?')}:{p.get('lineno', '?')}\n"
+            f"    Tasks: {p.get('task_count', 0)}  Components: {len(p.get('component_node_ids', []))}\n"
+            f"    Data edges: {p.get('edge_count', 0)}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_kfp_pipeline(pipeline_id: str) -> str:
+    """Get the full DAG for a specific KFP pipeline.
+
+    Returns the pipeline's component nodes with their typed parameters
+    (Input/Output annotations) and all data-dependency edges showing how
+    data flows between components.
+
+    Args:
+        pipeline_id: Pipeline ID from list_kfp_pipelines (e.g. "pipeline.py:ml_pipeline").
+    """
+    try:
+        data = _get(f"/graph/kfp/pipeline/{pipeline_id}")
+    except httpx.ConnectError:
+        return f"ERROR: Cannot connect to CodeGraph at {CODEGRAPH_URL}."
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return f"Pipeline not found: {pipeline_id}. Use list_kfp_pipelines to find valid IDs."
+        raise
+
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+    stats = data.get("stats", {})
+
+    lines = [
+        f"KFP Pipeline: {stats.get('name', pipeline_id)}",
+        f"  File: {stats.get('file', '?')}:{stats.get('lineno', '?')}",
+        f"  Components: {len([n for n in nodes if n.get('type') == 'kfp_component'])}",
+        f"  Data edges: {len([e for e in edges if (e.get('type') or '').startswith('data_dependency')])}",
+        "\nComponents:",
+    ]
+
+    for n in nodes:
+        if n.get("type") != "kfp_component":
+            continue
+        params = n.get("kfp_params", [])
+        inputs = [p for p in params if p["kind"] == "input"]
+        outputs = [p for p in params if p["kind"] == "output"]
+        lines.append(f"\n  @component {n.get('short_name', n.get('id', '?'))}")
+        lines.append(f"    ID: {n['id']}")
+        if inputs:
+            lines.append("    Inputs:")
+            for p in inputs:
+                ann = f": {p['annotation']}" if p.get("annotation") else ""
+                lines.append(f"      • {p['name']}{ann}")
+        if outputs:
+            lines.append("    Outputs:")
+            for p in outputs:
+                ann = f": {p['annotation']}" if p.get("annotation") else ""
+                lines.append(f"      → {p['name']}{ann}")
+
+    data_edges = [e for e in edges if (e.get("type") or "").startswith("data_dependency")]
+    if data_edges:
+        lines.append("\nData flow:")
+        node_map = {n["id"]: n.get("short_name", n["id"]) for n in nodes}
+        for e in data_edges:
+            src_name = node_map.get(e["source"], e["source"])
+            tgt_name = node_map.get(e["target"], e["target"])
+            etype = e.get("type", "")
+            label = etype.split(":", 1)[1] if ":" in etype else ""
+            lines.append(f"  {src_name} ──({label})──▸ {tgt_name}")
 
     return "\n".join(lines)
 
