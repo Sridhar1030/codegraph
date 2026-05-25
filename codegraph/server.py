@@ -98,6 +98,7 @@ def clear_graph():
     _store._graph = None
     _store._code_graph = None
     _store._meta = {}
+    _store._kfp_meta = {}
     _scan_state["repo_path"] = None
     _scan_state["exclude_patterns"] = []
     _scan_state["last_scan_time"] = None

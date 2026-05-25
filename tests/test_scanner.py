@@ -1,0 +1,237 @@
+"""Tests for codegraph.scanner — AST parsing, KFP detection, and wiring extraction."""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from codegraph.scanner import scan_codebase, ScanResult
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Basic scanning: functions, classes, methods, imports
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestFunctionExtraction:
+
+    def test_discovers_top_level_functions(self, simple_scan: ScanResult):
+        names = {n.function for n in simple_scan.nodes}
+        assert {"greet", "format_greeting", "helper", "unused"}.issubset(names)
+
+    def test_discovers_class_methods(self, simple_scan: ScanResult):
+        methods = [n for n in simple_scan.nodes if n.class_name == "Calculator"]
+        assert {m.function for m in methods} == {"add", "multiply"}
+
+    def test_qualified_node_ids(self, simple_scan: ScanResult):
+        ids = {n.id for n in simple_scan.nodes}
+        assert "app.py:greet" in ids
+        assert "app.py:Calculator.add" in ids
+        assert "util.py:helper" in ids
+
+    def test_class_names_tracked(self, simple_scan: ScanResult):
+        assert "Calculator" in simple_scan.class_names
+
+
+class TestNodeAttributes:
+
+    def test_async_function(self, multi_file_scan: ScanResult):
+        node = next(n for n in multi_file_scan.nodes if n.function == "fetch_user")
+        assert node.is_async is True
+
+    def test_sync_function_default(self, simple_scan: ScanResult):
+        node = next(n for n in simple_scan.nodes if n.function == "greet")
+        assert node.is_async is False
+
+    def test_decorators_extracted(self, tmp_path: Path):
+        (tmp_path / "d.py").write_text("def r(f): return f\n\n@r\ndef index(): pass\n")
+        node = next(n for n in scan_codebase(str(tmp_path)).nodes if n.function == "index")
+        assert "r" in node.decorators
+
+    def test_docstring_first_line(self, simple_scan: ScanResult):
+        node = next(n for n in simple_scan.nodes if n.function == "greet")
+        assert node.docstring == "Say hello."
+
+    def test_line_count(self, simple_scan: ScanResult):
+        node = next(n for n in simple_scan.nodes if n.function == "greet")
+        assert node.lines >= 2
+
+    def test_param_count(self, simple_scan: ScanResult):
+        node = next(n for n in simple_scan.nodes if n.function == "greet")
+        assert node.params == 1
+
+
+class TestCallExtraction:
+
+    def test_direct_call_captured(self, simple_scan: ScanResult):
+        calls = simple_scan.raw_calls.get("app.py:greet", [])
+        assert any(c.name == "format_greeting" for c in calls)
+
+    def test_self_call_has_receiver(self, simple_scan: ScanResult):
+        calls = simple_scan.raw_calls.get("app.py:Calculator.multiply", [])
+        self_calls = [c for c in calls if c.receiver == "self"]
+        assert any(c.name == "add" for c in self_calls)
+
+    def test_call_order_assigned(self, simple_scan: ScanResult):
+        calls = simple_scan.raw_calls.get("app.py:greet", [])
+        assert all(c.order >= 1 for c in calls)
+
+
+class TestExcludePatterns:
+
+    def test_excluded_files_skipped(self, tmp_path: Path):
+        (tmp_path / "main.py").write_text("def keep(): pass\n")
+        (tmp_path / "setup.py").write_text("def skip(): pass\n")
+        scan = scan_codebase(str(tmp_path), exclude_patterns=["setup.py"])
+        assert {n.function for n in scan.nodes} == {"keep"}
+
+    def test_excluded_directory(self, tmp_path: Path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "a.py").write_text("def inside(): pass\n")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "t.py").write_text("def test_fn(): pass\n")
+        scan = scan_codebase(str(tmp_path), exclude_patterns=["tests/"])
+        assert {n.function for n in scan.nodes} == {"inside"}
+
+
+class TestEdgeCases:
+
+    def test_empty_directory(self, tmp_path: Path):
+        scan = scan_codebase(str(tmp_path))
+        assert scan.nodes == []
+
+    def test_syntax_error_file_skipped(self, tmp_path: Path):
+        (tmp_path / "bad.py").write_text("def broken(:\n")
+        (tmp_path / "good.py").write_text("def works(): pass\n")
+        names = {n.function for n in scan_codebase(str(tmp_path)).nodes}
+        assert "works" in names
+        assert "broken" not in names
+
+    @pytest.mark.parametrize("filename,expected_generated", [
+        ("service_pb2.py", True),
+        ("service_pb2_grpc.py", True),
+        ("normal.py", False),
+    ])
+    def test_generated_file_by_filename(self, tmp_path: Path, filename, expected_generated):
+        (tmp_path / filename).write_text("def fn(): pass\n")
+        node = scan_codebase(str(tmp_path)).nodes[0]
+        assert node.is_generated is expected_generated
+
+    def test_generated_file_by_header(self, tmp_path: Path):
+        (tmp_path / "gen.py").write_text("# Generated by protoc. DO NOT EDIT.\ndef fn(): pass\n")
+        assert scan_codebase(str(tmp_path)).nodes[0].is_generated is True
+
+    def test_unicode_file_handled(self, tmp_path: Path):
+        (tmp_path / "uni.py").write_text("def café(): pass\n", encoding="utf-8")
+        assert len(scan_codebase(str(tmp_path)).nodes) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  KFP detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestKFPComponentDetection:
+
+    def test_components_found(self, kfp_scan: ScanResult):
+        assert kfp_scan.kfp_components == {"load_data", "preprocess", "train_model", "evaluate"}
+
+    def test_node_type_set(self, kfp_scan: ScanResult):
+        types = {n.function: n.node_type for n in kfp_scan.nodes}
+        assert types["load_data"] == "kfp_component"
+        assert types["preprocess"] == "kfp_component"
+
+    @pytest.mark.parametrize("decorator_code,expected_name", [
+        ("@dsl.component\ndef plain(): pass", "plain"),
+        ('@dsl.component(base_image="py:3.9")\ndef with_args(): pass', "with_args"),
+        ("@dsl.container_component\ndef container(): pass", "container"),
+    ])
+    def test_decorator_variants(self, tmp_path: Path, decorator_code, expected_name):
+        full = f"from kfp import dsl\n\n{decorator_code}\n"
+        (tmp_path / "c.py").write_text(full)
+        assert expected_name in scan_codebase(str(tmp_path)).kfp_components
+
+
+class TestKFPPipelineDetection:
+
+    def test_pipeline_found(self, kfp_scan: ScanResult):
+        assert kfp_scan.kfp_pipelines == {"ml_pipeline"}
+
+    def test_pipeline_node_type(self, kfp_scan: ScanResult):
+        p = next(n for n in kfp_scan.nodes if n.function == "ml_pipeline")
+        assert p.node_type == "kfp_pipeline"
+
+
+class TestKFPParamExtraction:
+
+    def test_input_params(self, kfp_scan: ScanResult):
+        node = next(n for n in kfp_scan.nodes if n.function == "train_model")
+        inputs = [p for p in node.kfp_params if p["kind"] == "input"]
+        param_map = {p["name"]: p["annotation"] for p in inputs}
+        assert param_map["data"] == "Input[Dataset]"
+        assert param_map["epochs"] == "int"
+
+    def test_return_type_as_output(self, kfp_scan: ScanResult):
+        node = next(n for n in kfp_scan.nodes if n.function == "train_model")
+        ret = next(p for p in node.kfp_params if p["name"] == "return")
+        assert ret["annotation"] == "Output[Model]"
+        assert ret["kind"] == "output"
+
+    def test_pipeline_params(self, kfp_scan: ScanResult):
+        node = next(n for n in kfp_scan.nodes if n.function == "ml_pipeline")
+        assert any(p["name"] == "source_url" for p in node.kfp_params)
+
+
+class TestKFPWiring:
+
+    def test_tasks_collected(self, kfp_scan: ScanResult):
+        key = next(iter(kfp_scan.kfp_tasks))
+        tasks = kfp_scan.kfp_tasks[key]
+        assert {t.component_name for t in tasks} == {
+            "load_data", "preprocess", "train_model", "evaluate",
+        }
+
+    def test_data_edges_count(self, kfp_scan: ScanResult):
+        assert len(kfp_scan.kfp_data_edges) == 4
+
+    @pytest.mark.parametrize("src,tgt,out_key,in_param", [
+        ("load_data", "preprocess", "output", "raw"),
+        ("preprocess", "train_model", "output", "data"),
+        ("preprocess", "evaluate", "output", "test_data"),
+        ("train_model", "evaluate", "output", "model"),
+    ])
+    def test_data_edge_details(self, kfp_scan, src, tgt, out_key, in_param):
+        match = [e for e in kfp_scan.kfp_data_edges
+                 if e.source_component == src and e.target_component == tgt]
+        assert len(match) == 1
+        assert match[0].output_key == out_key
+        assert match[0].input_param == in_param
+
+    def test_outputs_subscript_wiring(self, tmp_path: Path):
+        """task.outputs["key"] syntax for named outputs."""
+        code = textwrap.dedent("""\
+            from kfp import dsl
+            from kfp.dsl import Input, Output, Dataset
+
+            @dsl.component
+            def producer() -> Output[Dataset]: pass
+
+            @dsl.component
+            def consumer(data: Input[Dataset]): pass
+
+            @dsl.pipeline
+            def pipe():
+                p = producer()
+                c = consumer(data=p.outputs["result"])
+        """)
+        (tmp_path / "p.py").write_text(code)
+        edges = scan_codebase(str(tmp_path)).kfp_data_edges
+        assert len(edges) == 1
+        assert edges[0].output_key == "result"
+
+    def test_no_kfp_in_plain_repo(self, simple_scan: ScanResult):
+        assert simple_scan.kfp_components == set()
+        assert simple_scan.kfp_pipelines == set()
+        assert simple_scan.kfp_data_edges == []

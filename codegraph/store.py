@@ -350,6 +350,7 @@ class NetworkXStore(GraphStore):
         data = {
             "graph": self._graph,
             "meta": self._meta,
+            "kfp_meta": self._kfp_meta,
         }
         Path(path).write_bytes(pickle.dumps(data))
 
@@ -361,6 +362,7 @@ class NetworkXStore(GraphStore):
             data = pickle.loads(p.read_bytes())
             self._graph = data["graph"]
             self._meta = data.get("meta", {})
+            self._kfp_meta = data.get("kfp_meta", {})
             return True
         except (pickle.UnpicklingError, KeyError, EOFError):
             return False
